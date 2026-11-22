@@ -237,6 +237,8 @@ DM_TOUCH_DOCKED	str		profile	start	hle_touch.c	touch in docked mode: "screen" = 
 DM_TOUCH_HAPTICS	int		debug,ios	?	DmGamepad.m	
 DM_TOUCH_LOG	str		debug	?	hle_touch.c	DM_TOUCH_LOG=1 also logs each gesture entry (up to 500 lines)
 DM_UDC_SELFTEST	str		debug,ios	?	nvn_mtl.m	
+DM_VK_AHB_CPU	str		debug	start	gfx_vk_core.c	the CPU usage of the pools' hardware buffers: `often` (cached) or `rarely` (uncached). Default: often, rarely where no memory type the driver offers for one is coherent (Mali-G720)
+DM_VK_AHB_FD	int		debug	start	gfx_vk_core.c	which fd of a hardware buffer's native handle is its dma-buf. Default: the first a shared read-write mapping accepts (MediaTek's gralloc sends a read-only one first)
 DM_VK_ASYNC_PIPE	bool	1	profile	live	gfx_vk_exec.c	0 = new pipelines are built on the replay thread, not in the background
 DM_VK_BC_DRAW	int	0	profile	start	gfx_vk_tex.c	BC texture stand-in mode for drivers without BC: 0 = off
 DM_VK_BIND_DUMP	str		debug	start	gfx_vk_exec.c	writes the storage of the texture that binding of that pixel shader really resolved to (at most 8 files) to `$DM_ROOT/bind_<fs>_b<binding>_<w>x<h>_f<format>_s<serial>.bin` (the current folder when `DM_ROOT` is unset); slots alone are polluted by stale entries of earlier draws

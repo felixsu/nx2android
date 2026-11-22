@@ -411,6 +411,51 @@ static int recv_fds(int sock, int *fds, int max) {
             for (size_t i = 0; i < (c->cmsg_len - CMSG_LEN(0)) / sizeof(int) && n < max; i++) fds[n++] = ((int *)CMSG_DATA(c))[i];
     return n;
 }
+// The hardware buffer's dma-buf, the fd the pool's pages are mmapped from (the caller closes it), -1: none. Qualcomm's gralloc sends it first; MediaTek's (Mali-G720,
+// Dimensity, Android 16) sends a read-only anon_inode:gralloc_extra first, then the dma-buf, then a memfd of shared metadata, so fds[0] failed every mmap with EACCES
+// and every pool was copied (Pokémon Legends: Z-A at 3-4 fps: 925 MB merged back after each submission). The first fd a shared read-write mapping accepts, else fds[0].
+// DM_VK_AHB_FD=<n> (start-up, debugging): that index of the handle's fds
+static int ahb_dmabuf_fd(AHardwareBuffer *ahb) {
+    int sv[2], fds[16], nfd = -1, pick = -1;
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) return -1;
+    if (!AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
+    close(sv[0]); close(sv[1]);
+    if (nfd < 1) return -1;
+    static int forced = -2; if (forced == -2) { const char *e = getenv("DM_VK_AHB_FD"); forced = e && *e ? atoi(e) : -1; }
+    if (forced >= 0 && forced < nfd) pick = forced;
+    for (int i = 0; i < nfd && pick < 0; i++) {
+        void *t = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fds[i], 0);
+        if (t != MAP_FAILED) { munmap(t, 4096); pick = i; }
+    }
+    if (pick < 0) pick = 0;
+    static _Atomic int said; if (!atomic_exchange(&said, 1)) VKLOG("hardware buffers: %d fd(s) in the handle, the dma-buf is fd %d", nfd, pick);
+    for (int i = 0; i < nfd; i++) if (i != pick) close(fds[i]);
+    return fds[pick];
+}
+// The CPU usage pools' hardware buffers are allocated with. OFTEN gives the CPU a cached mapping, which the GPU sees only where the memory is coherent (Adreno: the
+// driver offers a HOST_COHERENT type for an imported buffer). Mali-G720's driver offers only a non-coherent type (HOST_CACHED without HOST_COHERENT): the GPU read
+// stale data and the CPU read stale GPU writes (probes/vkzc.c: thousands of wrong words a 64 MB copy). RARELY makes MediaTek's gralloc map it uncached for the CPU,
+// which is coherent (vkzc: 0 wrong words) but slow to read (1.2 s for 64 MB, 65x malloc memory): zc_uncached then sees it, as on Turnip, and keeps pools of one chunk
+// in cached memory until the GPU first uses them. DM_VK_AHB_CPU=often / rarely (start-up) forces it
+static uint64_t zc_cpu_usage(void) {
+    static uint64_t v; if (v) return v;
+    const uint64_t often = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, rarely = AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+    const char *e = getenv("DM_VK_AHB_CPU");
+    if (e && !strcmp(e, "often")) return v = often;
+    if (e && !strcmp(e, "rarely")) return v = rarely;
+    v = often;
+    AHardwareBuffer_Desc d = {1 << 16, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, often | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0}; AHardwareBuffer *ahb = NULL;
+    VkAndroidHardwareBufferPropertiesANDROID ap = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+    if (AHardwareBuffer_allocate(&d, &ahb)) return v;
+    if (!vkGetAndroidHardwareBufferPropertiesANDROID(V.dev, ahb, &ap)) {
+        int coherent = 0;
+        for (uint32_t t = 0; t < V.mem.memoryTypeCount; t++) if ((ap.memoryTypeBits >> t & 1) && (V.mem.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) coherent = 1;
+        if (!coherent) v = rarely;
+        VKLOG("hardware buffers: memory types %#x, %s", ap.memoryTypeBits, coherent ? "a coherent one among them" : "none coherent: pools allocated for rare CPU use (uncached, coherent)");
+    }
+    AHardwareBuffer_release(ahb);
+    return v;
+}
 static const VkBufferUsageFlags POOL_USAGE0 = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
     VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
@@ -506,14 +551,9 @@ static slab_t *slab_new(int c) {   // a slab of class c, allocated and imported 
     if (sb * n < (2u << 20)) n = (uint32_t)((2u << 20) / sb); if (sb * n > (8u << 20)) n = (uint32_t)((8u << 20) / sb); if (n > SLAB_SLOTS) n = SLAB_SLOTS;
     uint64_t size = sb * n; slab_t *s = calloc(1, sizeof *s); if (!s) return NULL;
     s->slot_bytes = sb; s->nslot = s->nfree = n; s->fd = -1;
-    AHardwareBuffer_Desc d = {(uint32_t)size, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
+    AHardwareBuffer_Desc d = {(uint32_t)size, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, zc_cpu_usage() | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
     if (AHardwareBuffer_allocate(&d, &s->ahb)) { free(s); return NULL; }
-    int sv[2], fds[16], nfd = -1;
-    if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) {
-        if (!AHardwareBuffer_sendHandleToUnixSocket(s->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
-        close(sv[0]); close(sv[1]);
-    }
-    if (nfd >= 1) { s->fd = fds[0]; for (int i = 1; i < nfd; i++) close(fds[i]); }
+    s->fd = ahb_dmabuf_fd(s->ahb);
     s->map = s->fd >= 0 ? mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0) : MAP_FAILED;
     VkAndroidHardwareBufferPropertiesANDROID ap = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
     VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
@@ -637,25 +677,19 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size, int lazy, co
         mem_diag_zc(11, "mmap-fixed slab", size, "errno", errno);   // (the old pages are still there: a buffer of its own)
     }
     AHardwareBuffer_Desc d = {(uint32_t)size, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB,
-        AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
+        zc_cpu_usage() | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
     if (size > 0xffffffffull) { mem_diag_zc(0, "size", size, "limit", -1); return -1; }
     zcfree_t re; int reuse = zcf_take(size, &re);
     AHardwareBuffer *ahb = reuse ? re.ahb : NULL; int ar = reuse ? 0 : AHardwareBuffer_allocate(&d, &ahb);
     if (ar) { mem_diag_zc(1, "AHardwareBuffer_allocate", size, "return", ar); return -1; }
 #define ZC_DROP() do { if (reuse) zcf_free_now(&re); else AHardwareBuffer_release(ahb); } while (0)
-    int sv[2]; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) {
-        mem_diag_zc(2, "socketpair", size, "errno", errno); ZC_DROP(); return -1; }
-    int fds[16], nfd = -1;
-    ar = AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0]);
-    if (!ar) { nfd = recv_fds(sv[1], fds, 16); if (nfd < 1) mem_diag_zc(4, "recv_fds", size, "return", nfd); }
-    else mem_diag_zc(3, "AHardwareBuffer_sendHandleToUnixSocket", size, "return", ar);
-    close(sv[0]); close(sv[1]);
-    if (nfd < 1) { ZC_DROP(); return -1; }
+    int fd = ahb_dmabuf_fd(ahb);
+    if (fd < 0) { mem_diag_zc(4, "the hardware buffer's dma-buf", size, "fd", fd); ZC_DROP(); return -1; }
     // copy the pool's current contents into the buffer through a temporary mapping, then put the buffer's pages at the pool's address
-    zcfill_t f = {fds[0], 0, NULL, 0, in}; int rc = zc_place(mem, size, &f, lazy, &done);
+    zcfill_t f = {fd, 0, NULL, 0, in}; int rc = zc_place(mem, size, &f, lazy, &done);
     if (rc == -5) mem_diag_zc(5, "mmap-temporary", size, "errno", errno);
     else if (rc == -6) mem_diag_zc(6, "mmap-fixed", size, "errno", errno);
-    for (int i = 0; i < nfd; i++) close(fds[i]);
+    close(fd);
     if (rc) { p->left = zc_unplace(mem, done, lazy, in); ZC_DROP(); return rc == 1 || rc == 2 ? rc : -1; }   // (a slice swapped before the failing one goes back first)
 #undef ZC_DROP
     if (reuse) { p->buf = re.buf; p->mem = re.mem; p->ahb = ahb; p->zero_copy = 1; return 0; }   // imported already
@@ -695,12 +729,8 @@ static int pool_fd(const vkpool_t *p, int *own) {
     *own = 0;
     if (!p->zero_copy) return -1;
     if (p->slab) return ((slab_t *)p->slab)->fd;
-    int sv[2], fds[16], nfd = -1; if (!p->ahb || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) return -1;
-    if (!AHardwareBuffer_sendHandleToUnixSocket(p->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
-    close(sv[0]); close(sv[1]);
-    for (int k = 1; k < nfd; k++) close(fds[k]);
-    if (nfd < 1) return -1;
-    *own = 1; return fds[0];
+    int fd = p->ahb ? ahb_dmabuf_fd(p->ahb) : -1; if (fd < 0) return -1;
+    *own = 1; return fd;
 }
 // A zero-copy pool's dma-buf mapped again over [mem, mem+len) in one piece per chunk, read-only (nvn_dirty_defrag: the mappings its protection split never merge), but for
 // the pools inside it, whose pages stay their own. 0 = done; 1 = nothing mapped (no pool is exactly [mem, mem+len): a pool not whole host pages, whose tracked range is
@@ -792,12 +822,11 @@ static uint64_t read_ns(const uint8_t *p, size_t n) {
 static int zc_uncached(void) {
     static int v = -1; if (v >= 0) return v;
     enum { N = 1 << 20 }; v = 0;
-    AHardwareBuffer_Desc d = {N, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
+    AHardwareBuffer_Desc d = {N, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB, zc_cpu_usage() | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, 0, 0, 0};
     AHardwareBuffer *ahb = NULL; if (AHardwareBuffer_allocate(&d, &ahb)) return v;
-    int sv[2], fds[16], nfd = -1;
-    if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { if (!AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16); close(sv[0]); close(sv[1]); }
-    uint8_t *a = nfd >= 1 ? mmap(NULL, N, PROT_READ | PROT_WRITE, MAP_SHARED, fds[0], 0) : MAP_FAILED, *m = malloc(N);
-    for (int i = 0; i < nfd; i++) close(fds[i]);
+    int fd = ahb_dmabuf_fd(ahb);
+    uint8_t *a = fd >= 0 ? mmap(NULL, N, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED, *m = malloc(N);
+    if (fd >= 0) close(fd);
     if (a != MAP_FAILED && m) {
         memset(a, 1, N); memset(m, 1, N);
         uint64_t ta = read_ns(a, N), tm = read_ns(m, N); v = ta > 4 * tm;
