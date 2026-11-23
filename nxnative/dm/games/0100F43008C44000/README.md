@@ -35,6 +35,7 @@ Read the profile's porting log in the comment header of [`android.tsv`](android.
 | Device | GPU | Vulkan driver | Game version | nx2android | Result |
 |---|---|---|---|---|---|
 | Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16) | Adreno 830 | not recorded | 2.0.2 (v393216) | `v0.3.0` | playable |
+| POCO 2511FPC34G (MediaTek MT6899, Android 16) | Mali-G720 MC8 | Arm r49p1 | 1.0.0 (v0) | fork `fix/mali-vs-layer` | renders correctly to Lumiose station, 30 fps |
 
 What was tested:
 
@@ -46,4 +47,4 @@ What was tested:
 
 ## Quirks and known issues
 
-- Not recorded.
+- Mali GPUs: the colour grading needs the `vs_layer_gs` GPU quirk (on by default for Arm's Mali driver). Without it the whole game is near black, with only yellows, oranges and greens left: that driver draws the 3D colour-grading table's slices 8-31 from a vertex shader into nothing.

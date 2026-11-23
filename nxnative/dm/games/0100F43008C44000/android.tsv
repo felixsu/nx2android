@@ -17,6 +17,10 @@
 # FPSLocker-Warehouse's only Z-A config (1.0.1) is withdrawn; it patched the game's frame-time constants as well (ladders, rolling), so the present interval alone
 # is not enough. The stock 30 fps measurements above predate the restored 2.0.2 native timing stubs in patches.py.
 # The stubs follow the host's vsync step, gated by the main build ID and original bytes; fps_target selects 60, DM_FPS_TARGET=0 restores the game's own timing.
+# POCO 2511FPC34G (MediaTek MT6899, Mali-G720 MC8, driver r49p1, Android 16), 2026-11-23, base v0: the 3D scenes were near black (only low-blue colours left) though the
+# G-buffer, shadow map and lit HDR were right. The 32x32x32 colour-grading LUT (vertex shader b29f08619f379a83, 32 instances, gl_Layer = instance + 1 from the
+# vertex shader) kept slices 1-7 only: Mali's driver draws a vertex shader's layer into layers 0-7. The vs_layer_gs quirk (gfx_vk_vs_layer.c) has a generated
+# geometry shader write it: Lumiose station lit and coloured as on the Y700, 30 fps, GPU ~26 ms a frame as before.
 # Later PR testers reported on the restored 2.0.2 timing on AYN Thor and RP5; results vary by device. On a 60 Hz RP5, a 60 fps test pin produced uneven ~41 fps,
 # while 30 fps was smooth. The test pin is omitted to leave the adaptive cap in normal use; this final profile has not been tested on the RP5.
 status	playable

@@ -234,11 +234,17 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
         uint32_t l = k->attr[a].loc; int kind = vertex_integer_kind((VkFormat)k->attr[a].fmt);
         if ((kind == 2 && (stg[0]->local[1] >> l & 1)) || (kind == 1 && (stg[0]->local[2] >> l & 1))) vi_flip |= 1u << l;
     }
+    // the vs_layer_gs quirk (gfx_vk_vs_layer.c): a vertex shader that writes gl_Layer, with no geometry shader after it, gets one that writes the layer instead
+    // (Mali's driver draws a vertex shader's layer into layers 0-7 only). Not with transform feedback (the geometry shader would be the stage it captures)
+    VkShaderModule lgs = VK_NULL_HANDLE;
+    { int cls = k->topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 : k->topo <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1 : k->topo <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ? 2 : -1;
+      if (stg[0] && !stg[2] && !k->raster_discard && !k->alt && !stg[0]->xfb && cls >= 0 && vk_quirk(VQ_VS_LAYER_GS)) lgs = vk_shader_layer_gs(stg[0], k->um[0], k->im[0], xo[0], vi_flip, cls); }
     for (int i = 0; i < 3; i++) if (stg[i] && !(i == 1 && k->raster_discard)) {
         VkShaderModule mod = i == 2 && k->gs_split ? stg[i]->gs_mod[k->gs_split - 1] :
-            vk_shader_module(stg[i], k->um[i], k->im[i], k->alt && !k->um[i] && !k->im[i] && !xo[i] ? 1u << 31 : xo[i], i == 1 ? (k->fdz ? 1 : 0) | (k->dual ? 2 : 0) : 0, i == 0 ? vi_flip : 0);
+            vk_shader_module(stg[i], k->um[i], k->im[i], k->alt && !k->um[i] && !k->im[i] && !xo[i] ? 1u << 31 : xo[i], i == 1 ? (k->fdz ? 1 : 0) | (k->dual ? 2 : 0) : i == 0 && lgs ? 4 : 0, i == 0 ? vi_flip : 0);
         ss[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(fl[i], NULL), 0, fl[i], mod, "main", NULL};   // (pNext: DM_VK_SUBGROUP_PIN)
     }
+    if (lgs) ss[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, lgs, "main", NULL};
     int flat = (int)k->debug_mode;
     if (!fs) flat = 0;
     if (flat & 1) {   // DM_VK_X_FLAT_VS: the fragment stage becomes flatdbg.frag

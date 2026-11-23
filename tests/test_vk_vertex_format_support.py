@@ -42,6 +42,11 @@ static VkShaderModule vk_shader_module(vkshader_t *s, uint64_t a, uint64_t b, ui
     (void)s; (void)a; (void)b; (void)c; (void)d; (void)e;
     return (VkShaderModule)(uintptr_t)12;
 }
+enum { VQ_VS_LAYER_GS };
+static int vk_quirk(int q) { (void)q; return 0; }
+static VkShaderModule vk_shader_layer_gs(vkshader_t *s, uint64_t a, uint64_t b, uint32_t c, uint32_t e, int cls) {
+    (void)s; (void)a; (void)b; (void)c; (void)e; (void)cls; return VK_NULL_HANDLE;
+}
 static const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local) {
     (void)stage; (void)local; return NULL;
 }

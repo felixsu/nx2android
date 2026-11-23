@@ -9,6 +9,7 @@
 enum vk_quirk {
     VQ_LRZ_TOUCH,    // Adreno LRZ: one-texel depth reads around passes that load depth (gfx_vk_exec_passes.inc lrz_touch); default of DM_VK_LRZ_TOUCH
     VQ_GS_SPLIT,     // geometry-shader split draws (gfx_vk_gs_split.c) run on this GPU when a profile asks (DM_VK_GS_SPLIT=1)
+    VQ_VS_LAYER_GS,  // a vertex shader's gl_Layer written by a geometry shader instead (gfx_vk_vs_layer.c): Mali's driver draws it into layers 0-7 only
     VQ_COUNT
 };
 

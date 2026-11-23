@@ -554,16 +554,17 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint32_t vi) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
     VkShaderModule m = vk_shader_module_(s, um, im, xo, fd, vi); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[3] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return m; }
 static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint32_t vi) {
-    int dual = fd >> 1 & 1; fd &= 1;   // fd bit 1: the dual-source variant
+    int lay = fd >> 2 & 1, dual = fd >> 1 & 1; fd &= 1;   // fd bit 1: the dual-source variant; bit 2: gl_Layer at an output location (vk_shader_layer_gs)
     if (fd && (s->stage != 1 || s->depth_repl)) fd = 0;
     if (dual && s->stage != 1) dual = 0;
-    if (!(um | im | xo | (uint32_t)fd | (uint32_t)dual | vi) || !s->spv) return s->mod;
+    if (lay && s->stage != 0) lay = 0;
+    if (!(um | im | xo | (uint32_t)fd | (uint32_t)dual | vi | (uint32_t)lay) || !s->spv) return s->mod;
     if (xo == 1u << 31) {   // DM_VK_SPV_ALT
         pthread_mutex_lock(&g_sh_mu); for (int i = 0; i < s->nvar; i++) if (s->var[i].um == 0 && s->var[i].im == 0 && s->var[i].xo == xo) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
         VkShaderModule m = alt_module(s); if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){0, 0, xo, 0, m}; pthread_mutex_unlock(&g_sh_mu); return m; }
     xo &= ~(1u << 31);
     pthread_mutex_lock(&g_sh_mu);
-    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1) && s->var[i].vi == vi) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
+    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1 | lay << 2) && s->var[i].vi == vi) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
     uint16_t bind[64]; uint8_t kind[64]; int nb = 0;
     for (int i = 0; i < s->nbind && i < 64; i++) if ((um | im) >> i & 1) { bind[nb] = s->b[i].binding; kind[nb++] = um >> i & 1 ? 1 : 2; }
     uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
@@ -572,14 +573,36 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
     if (fd && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_frag_depth(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
     if (dual && (w || !(nb || xo || fd))) { uint32_t n2 = 0, *w2 = spv_dual(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
     if (vi) { uint32_t n2 = 0, *w2 = spv_vertex_signedness(w ? w : s->spv, nw, vi, &n2); free(w); w = w2; nw = n2; }
+    uint32_t lloc = 0;   // the layer's location (lay)
+    if (lay && (w || !(nb || xo || vi))) { uint32_t nloc = V.props.limits.maxVertexOutputComponents / 4, gin = V.props.limits.maxGeometryInputComponents / 4, n2 = 0;
+        if (gin < nloc) nloc = gin; if (nloc > 32) nloc = 32;
+        uint32_t *w2 = spv_vs_layer_loc(w ? w : s->spv, nw, nloc, &lloc, &n2); free(w); w = w2; nw = n2; }
+    VkShaderModule lgs[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     if (w) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
         if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual); }
-        else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), outputs added %#x, fragment depth written %d, dual source %d", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual);
+        else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), outputs added %#x, fragment depth written %d, dual source %d%s", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual, lay ? ", gl_Layer at an output location" : "");
+        if (lay && m != s->mod) {   // the geometry shaders that write that layer, one for each kind of input primitive (gfx_vk_vs_layer.c)
+            int made = 0;
+            for (int c = 0; c < 3; c++) { uint32_t gn = 0, *g = spv_layer_gs(w, nw, lloc, c, V.has_gs_pointsize, &gn);
+                if (g) { VkShaderModuleCreateInfo gi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)gn * 4, g}; if (vkCreateShaderModule(V.dev, &gi, NULL, &lgs[c])) lgs[c] = VK_NULL_HANDLE; else made++; free(g); } }
+            VKLOG("vertex shader %016llx writes gl_Layer: at location %u, %d of 3 geometry shaders made to write it (vs_layer_gs quirk)", (unsigned long long)s->key, lloc, made); }
         free(w); }
     else VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual);
-    if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fd | dual << 1, m, vi};
+    if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fd | dual << 1 | lay << 2, m, vi, {lgs[0], lgs[1], lgs[2]}};
+    else for (int c = 0; c < 3; c++) if (lgs[c]) vkDestroyShaderModule(V.dev, lgs[c], NULL);   // (no room to keep them: vk_shader_layer_gs finds none)
     pthread_mutex_unlock(&g_sh_mu);
     return m;
+}
+VkShaderModule vk_shader_layer_gs(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, uint32_t vi, int cls) {
+    if (!s || s->stage != 0 || !s->spv || cls < 0 || cls > 2 || !V.has_gs) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_sh_mu); if (!s->vs_layer) s->vs_layer = spv_vs_writes_layer(s->spv, s->nspv) ? 1 : 2; int yes = s->vs_layer == 1; pthread_mutex_unlock(&g_sh_mu);
+    if (!yes) return VK_NULL_HANDLE;
+    vk_shader_module(s, um, im, xo, 4, vi);   // makes the variant and its geometry shaders
+    VkShaderModule g = VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_sh_mu);
+    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == 4 && s->var[i].vi == vi) { g = s->var[i].lgs[cls]; break; }
+    pthread_mutex_unlock(&g_sh_mu);
+    return g;
 }
 // Static support, zero and disabled-attribute buffers. Maxwell supplies (0,0,0,1) for disabled generic attributes; its register words are float bit patterns even when a shader reads them as integers.
 static VkBuffer static_buf(int which) {
