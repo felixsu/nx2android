@@ -11,6 +11,7 @@ unsigned char g_vk_quirks[VQ_COUNT];
 vk_gpu g_vk_gpu;
 
 static int adreno(const vk_gpu *g) { return g->vendor == VENDOR_QUALCOMM; }   // both drivers: Qualcomm's own and Mesa's Turnip
+static int mali(const vk_gpu *g) { return g->driver == VK_DRIVER_ID_ARM_PROPRIETARY; }   // Arm's own driver (not Mesa's PanVK)
 
 static const struct {
     enum vk_quirk q; const char *name, *setting; int (*match)(const vk_gpu *); const char *why;
@@ -21,6 +22,9 @@ static const struct {
     // written for NieR:Automata
     {VQ_GS_SPLIT, "gs_split", "DM_VK_QUIRK_GS_SPLIT", adreno,
      "geometry-shader draws split into vertex and fragment passes: written and checked on Adreno only"},
+    // found with Pokémon Legends: Z-A's colour-grading LUT on a Mali-G720 (driver r49p1)
+    {VQ_VS_LAYER_GS, "vs_layer_gs", "DM_VK_QUIRK_VS_LAYER_GS", mali,
+     "a vertex shader's gl_Layer reaches layers 0-7 only (a geometry shader's reaches all): such vertex shaders get a geometry shader that writes it"},
 };
 _Static_assert(sizeof ROWS / sizeof *ROWS == VQ_COUNT, "one row a quirk");
 

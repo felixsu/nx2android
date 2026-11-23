@@ -67,6 +67,10 @@ const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local);   // 
 // NULL when there is nothing the stage lacks (why empty) or it uses something not covered (why names it); the module then stays as it is
 uint32_t *spv_one_lane(const uint32_t *w, uint32_t nw, uint32_t ops, uint32_t *onw, char *why, size_t nwhy);
 uint32_t *spv_gs_split(const uint32_t *w, uint32_t nw, int mode, uint32_t *onw, char *why, size_t nwhy);
+// gfx_vk_vs_layer.c (the vs_layer_gs quirk): a vertex shader's gl_Layer moved to an output location, and the geometry shader that writes it from there
+int spv_vs_writes_layer(const uint32_t *w, uint32_t nw);
+uint32_t *spv_vs_layer_loc(const uint32_t *w, uint32_t nw, uint32_t nloc, uint32_t *loc, uint32_t *onw);
+uint32_t *spv_layer_gs(const uint32_t *w, uint32_t nw, uint32_t loc, int cls, int psize, uint32_t *onw);
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
 void vk_init(void);   // once, from mtl_init or the first use
 
@@ -168,17 +172,21 @@ typedef struct {
     uint8_t dyn[96]; int ndyn;          // bindings of uniform buffers bound with a dynamic offset (gfx_vk_exec.c stage_set), and their count
     int xfb; uint32_t xfb_stride[4];    // a vertex shader that captures transform feedback (its SPIR-V has the Xfb execution mode), and each buffer's stride
     uint32_t *spv, nspv;                // its SPIR-V as the module was made from it, for the variants below
-    struct { uint64_t um, im; uint32_t xo; int fd; VkShaderModule mod; uint32_t vi; } var[8]; int nvar;   // variants whose sampled bindings (bit = index in b) of an integer view read uint (um) / int (im) texels,
+    struct { uint64_t um, im; uint32_t xo; int fd; VkShaderModule mod; uint32_t vi; VkShaderModule lgs[3]; } var[8]; int nvar;   // variants whose sampled bindings (bit = index in b) of an integer view read uint (um) / int (im) texels,
                                                                                     // that declare the vec4 outputs xo (bit = location) the next stage reads, and (fd) that write gl_FragDepth = gl_FragCoord.z
     int depth_repl;                     // a fragment shader that writes gl_FragDepth (DepthReplacing / DepthGreater / DepthLess)
     uint32_t in_locs, out_locs;         // the vec4 (or per-vertex vec4) inputs and outputs it declares, by location
     int setmemo;                        // gfx_vk_exec.c stage_set: 1 its set may be memoized per stage, 2 not (it reads handles or addresses from uniform buffer memory), 0 not known yet
     int wmem;                           // gfx_vk_exec.c shader_wmem: 1 it writes memory (stores to storage buffers or images, atomics), 2 not, 0 not known yet
     int gs_split; VkShaderModule gs_mod[2]; // 1: effects/raster modules ready, 2: cannot safely separate, 0: not checked
+    int vs_layer;                       // a vertex shader that writes gl_Layer: 1 yes, 2 no, 0 not checked yet (vk_shader_layer_gs)
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint32_t vi);   // the module, or its variant (integer views; extra outputs; fragment depth written)
+// the vs_layer_gs quirk: for a vertex shader that writes gl_Layer, the geometry shader for its variant (fd 4 in vk_shader_module) and input primitive cls
+// (0 points, 1 lines, 2 triangles); VK_NULL_HANDLE when it writes no layer or none could be made (the pipeline then keeps the vertex shader's own)
+VkShaderModule vk_shader_layer_gs(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, uint32_t vi, int cls);
 int vk_shader_gs_split_ready(vkshader_t *s); // both modules exist before either pass may be recorded
 void vk_shaders_open(const char *path);
 VkBuffer vk_support_buffer(void);
