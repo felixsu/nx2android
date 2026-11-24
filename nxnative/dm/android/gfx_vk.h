@@ -23,7 +23,7 @@
 // ---- Vulkan entry points (loaded from libvulkan.so) ----
 #define VK_FNS(X) \
     X(vkCreateInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures2) \
-    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
+    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
     X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
     X(vkCreateAndroidSurfaceKHR) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR)
 #define VK_DEV_FNS(X) \
@@ -92,6 +92,9 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
 void vk_defer_free_buffer(VkBuffer b, VkDeviceMemory m);   // destroyed once the GPU has passed the current submission
 void vk_defer_free_image(VkImage i, VkDeviceMemory m);
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub);   // NULL on failure; *sub: a slot of a shared block, or NULL (memory of its own)
+void vk_imgblk_stats(uint64_t *bytes, uint64_t *used, uint64_t *freed);   // shared image blocks: memory held, slots in use, blocks given back so far
+uint64_t vk_img_mem_bytes(void);   // device memory of the images live (gfx_vk_tex.c)
+void vk_img_mem_formats(char *b, size_t n);   // and by the format they hold, in MB
 void vk_defer_free_image_sub(VkImage i, void *sub);
 void vk_defer_free_view(VkImageView v);
 void vk_defer_free_bview(VkBufferView v);   // a texel buffer view, destroyed when this submission completes
@@ -99,11 +102,16 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l);    // from this submissio
 uint64_t vk_fence_done(void);   // the highest submission fence the GPU has completed
 
 // ---- formats and textures (gfx_vk_tex.c) ----
-// dec: a BC format the device lacks, decoded on the CPU (gfx_vk_tex.c bc_decode) into vk, dbpp bytes a texel; bw, bh and bpb stay the guest's blocks
-typedef struct { VkFormat vk; VkComponentMapping swz; uint8_t kind; uint8_t depth, stencil, compressed, is_int, is_sint, bw, bh, bpb, dec, dbpp; } vkfmt_t;
+// dec: a BC format the device lacks, decoded on the CPU (gfx_vk_tex.c bc_decode) into vk, dbpp bytes a texel; bw, bh and bpb stay the guest's blocks. astc: ASTC 4x4 blocks
+// instead (gfx_vk_astc.c; vk is ASTC_4x4, 16 bytes a block of 4x4 texels: vk_dec_bytes), 1 BC1 blocks rewritten, 2 decoded to RGBA8 and encoded
+typedef struct { VkFormat vk; VkComponentMapping swz; uint8_t kind; uint8_t depth, stencil, compressed, is_int, is_sint, bw, bh, bpb, dec, dbpp, astc; } vkfmt_t;
 const vkfmt_t *vk_fmt(int nvn_format);   // NULL when the format has no Vulkan counterpart on this device
 void vk_bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst);   // (f->dec) gfx_vk_tex.c bc_decode
+size_t vk_dec_bytes(const vkfmt_t *f, uint32_t w, uint32_t h, uint32_t z);   // (f->dec) the bytes bc_decode writes for w x h x z texels
+void bc1_to_astc(const uint8_t *src, size_t pitch, uint32_t bx, uint32_t by, uint32_t z, int rgb, uint8_t *dst);   // gfx_vk_astc.c: rows of BC1 blocks as tight ASTC 4x4 blocks
+void rgba_to_astc(const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst);   // gfx_vk_astc.c: RGBA8 texels encoded as tight ASTC 4x4 blocks
 typedef struct vkimg vkimg_t;
+void vk_img_mem_count(vkimg_t *im, uint64_t size, int cls);   // (img_new) its memory counted, by class: 0, or the BC format decoded on the CPU (vkfmt_t dec)
 struct vkimg {
     VkImageUsageFlags usage; VkImageCreateFlags cflags;   // as created (an imageless framebuffer names them)
     VkImage img; VkDeviceMemory mem; void *sub; VkFormat fmt; VkImageViewType vtype; VkImageAspectFlags aspect;
@@ -133,6 +141,7 @@ struct vkimg {
     vkimg_t *bc_draw;               // a block-compressed image drawn into through an uncompressed view: the image in that format, its size in blocks, that the passes
                                     // draw into in its place (gfx_vk_tex.c vk_tex_view_as), copied into it at each pass's end (gfx_vk_exec.c bc_draw_back)
     vkimg_t *bc_of;                 // such a stand-in: the block-compressed image it is drawn for
+    uint64_t msize; uint8_t mcls;   // its device memory (vkGetImageMemoryRequirements) and the class it is counted in (gfx_vk_tex.c g_imem)
     uint32_t bc_lv, bc_ly, bc_nly;  // and the level and the layers (depth slices) of its last attachment view
     int bc_tried;                   // a block-compressed image: a stand-in was tried for it (one attempt: one log line, no image made at every pass)
     uint64_t pool; int64_t off, size; int flags;   // its storage (pool, offset, layout size) and NVN texture flags: images over the same memory find each other

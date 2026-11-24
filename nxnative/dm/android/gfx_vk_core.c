@@ -1410,6 +1410,10 @@ enum { IMG_CLASSES = 18, IMG_BLOCK = 32 << 20 };
 typedef struct imgblk { VkDeviceMemory m; uint32_t type, cls, nslot, nfree; uint64_t bits[128]; struct imgblk *next; } imgblk;   // bits: 1 = slot free
 typedef struct { imgblk *b; uint32_t slot; } imgsub;
 static imgblk *g_imgblk[IMG_CLASSES]; static pthread_mutex_t g_imgblk_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_imgblk_bytes, g_imgblk_used, g_imgblk_freed;   // under g_imgblk_mu: blocks' memory, slots taken (their class size), blocks given back
+void vk_imgblk_stats(uint64_t *bytes, uint64_t *used, uint64_t *freed) {
+    pthread_mutex_lock(&g_imgblk_mu); *bytes = g_imgblk_bytes; *used = g_imgblk_used; *freed = g_imgblk_freed; pthread_mutex_unlock(&g_imgblk_mu);
+}
 static VkDeviceSize img_class_size(int c) { return (c & 1 ? 6144ull : 4096ull) << (c >> 1); }   // 4K, 6K, 8K, 12K, 16K, 24K, ... 2M
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub) {
     *off = 0; *sub = NULL;
@@ -1426,16 +1430,31 @@ VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, V
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)b->nslot * img_class_size(c), type};
         if (vkAllocateMemory(V.dev, &ai, NULL, &b->m)) { pthread_mutex_unlock(&g_imgblk_mu); free(b); return VK_NULL_HANDLE; }
         for (uint32_t i = 0; i < b->nslot; i++) b->bits[i >> 6] |= 1ull << (i & 63);
-        b->nfree = b->nslot; b->next = g_imgblk[c]; g_imgblk[c] = b;
+        b->nfree = b->nslot; b->next = g_imgblk[c]; g_imgblk[c] = b; g_imgblk_bytes += ai.allocationSize;
     }
     uint32_t i = 0; while (!b->bits[i >> 6]) i += 64; i += (uint32_t)__builtin_ctzll(b->bits[i >> 6]);
-    b->bits[i >> 6] &= ~(1ull << (i & 63)); b->nfree--;
+    b->bits[i >> 6] &= ~(1ull << (i & 63)); b->nfree--; g_imgblk_used += img_class_size(c);
     pthread_mutex_unlock(&g_imgblk_mu);
     imgsub *s = malloc(sizeof *s); s->b = b; s->slot = i; *sub = s; *off = (VkDeviceSize)i * img_class_size(c);
     return b->m;
 }
-static void img_sub_free(imgsub *s) {   // the slot is free again; blocks are kept (the next images of the class take them)
-    pthread_mutex_lock(&g_imgblk_mu); s->b->bits[s->slot >> 6] |= 1ull << (s->slot & 63); s->b->nfree++; pthread_mutex_unlock(&g_imgblk_mu); free(s);
+// The slot is free again (the GPU is past the image's last use). A block left empty goes back to the driver when its class has another empty one of the memory type
+// already: blocks were kept for good, and a game that streams its textures (Pokemon Legends Z-A walking through the city, BC decoded on the CPU on Mali) kept the
+// blocks of every texture it had dropped. One empty block a class stays, so a texture made again right after one goes takes no new allocation
+static void img_sub_free(imgsub *s) {
+    pthread_mutex_lock(&g_imgblk_mu);
+    imgblk *b = s->b; b->bits[s->slot >> 6] |= 1ull << (s->slot & 63); b->nfree++; g_imgblk_used -= img_class_size((int)b->cls);
+    VkDeviceMemory gone = VK_NULL_HANDLE;
+    if (b->nfree == b->nslot) {
+        imgblk **pp = &g_imgblk[b->cls], *spare = NULL;
+        for (imgblk *o = *pp; o; o = o->next) if (o != b && o->type == b->type && o->nfree == o->nslot) { spare = o; break; }
+        if (spare) {
+            while (*pp != b) pp = &(*pp)->next;
+            *pp = b->next; gone = b->m; g_imgblk_bytes -= (uint64_t)b->nslot * img_class_size((int)b->cls); g_imgblk_freed++; free(b);
+        }
+    }
+    pthread_mutex_unlock(&g_imgblk_mu); free(s);
+    if (gone) vkFreeMemory(V.dev, gone, NULL);
 }
 void vk_defer_free_buffer(VkBuffer b, VkDeviceMemory m) { df_add(0, (void *)b, (void *)m); }
 void vk_defer_free_image_sub(VkImage i, void *sub) { df_add(4, (void *)i, sub); }
@@ -1809,9 +1828,11 @@ static void *memlog_main(void *arg) {
         sleep(s);
         if (!slurp_small("/proc/self/status", st, sizeof st) || !slurp_small("/proc/meminfo", mi, sizeof mi)) continue;
         const char *some = slurp_small("/proc/pressure/memory", ps, sizeof ps) ? strstr(ps, "avg10=") : NULL;
-        VKLOG("[mem] process: anon %ld MB, file %ld MB, shared %ld MB, swapped %ld MB | system: available %ld MB, free %ld MB, swap free %ld MB, pressure %.*s | pools: zero-copy %.0f MB (%.0f MB of it backed when first used, %.0f MB not used yet), copied %.0f MB, used %.0f MB",
+        uint64_t bb, bu, bf; vk_imgblk_stats(&bb, &bu, &bf); char fm[400]; vk_img_mem_formats(fm, sizeof fm);
+        VKLOG("[mem] process: anon %ld MB, file %ld MB, shared %ld MB, swapped %ld MB | system: available %ld MB, free %ld MB, swap free %ld MB, pressure %.*s | pools: zero-copy %.0f MB (%.0f MB of it backed when first used, %.0f MB not used yet), copied %.0f MB, used %.0f MB | images %.0f MB (shared blocks %.0f MB, %.0f MB in use; MB by format: %s)",
               kb_of(st, "RssAnon:") >> 10, kb_of(st, "RssFile:") >> 10, kb_of(st, "RssShmem:") >> 10, kb_of(st, "VmSwap:") >> 10,
-              kb_of(mi, "MemAvailable:") >> 10, kb_of(mi, "MemFree:") >> 10, kb_of(mi, "SwapFree:") >> 10, some ? 11 : 1, some ? some : "?", (g_zc_bytes + g_lazy_bytes) / 1048576.0, g_lazy_bytes / 1048576.0, (g_lazy_total - g_lazy_bytes) / 1048576.0, g_cp_bytes / 1048576.0, g_used_bytes / 1048576.0);
+              kb_of(mi, "MemAvailable:") >> 10, kb_of(mi, "MemFree:") >> 10, kb_of(mi, "SwapFree:") >> 10, some ? 11 : 1, some ? some : "?", (g_zc_bytes + g_lazy_bytes) / 1048576.0, g_lazy_bytes / 1048576.0, (g_lazy_total - g_lazy_bytes) / 1048576.0, g_cp_bytes / 1048576.0, g_used_bytes / 1048576.0,
+              vk_img_mem_bytes() / 1048576.0, bb / 1048576.0, bu / 1048576.0, fm);
     }
     return NULL;
 }

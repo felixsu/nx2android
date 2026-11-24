@@ -59,6 +59,30 @@ static const fent FT[0x9D] = {
     [0x99] = FX(VK_FORMAT_B8G8R8A8_UNORM), F(VK_FORMAT_B8G8R8A8_UNORM), FX(VK_FORMAT_B8G8R8A8_SRGB), F(VK_FORMAT_B8G8R8A8_SRGB),
 };
 static vkfmt_t g_fmt[0x9D]; static uint8_t g_fmt_done[0x9D];
+// BC textures as ASTC 4x4 (gfx_vk_astc.c) where the device samples, filters and copies into ASTC 4x4 in both its UNORM and sRGB forms: a quarter of the memory of
+// RGBA8 (Mali-G720: Pokemon Legends Z-A's textures took 1.2 GB decoded in Lumiose City, BC7 330 MB of it). BC1 blocks are rewritten one for one, nearly exactly
+// (DM_VK_BC1_ASTC=0: decoded into RGBA8 as before); BC7 is decoded and encoded again, one colour line a block of 4x4 texels, softer than BC7 where a block holds
+// several colours, at about 100 million texels a second on four threads of an M-series Mac (DM_VK_BC7_ASTC=0: decoded into RGBA8 as before). Both start-up switches
+static uint32_t g_astc_cls;   // the decode classes (vkfmt_t dec) given ASTC (the memory lines name them)
+static int astc_images_ok(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = V.has_astc;
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        for (int i = 0; v && i < 2; i++) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, i ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &fp);
+            if ((fp.optimalTilingFeatures & need) != need) v = 0; }
+        // the images as img_new makes them (MUTABLE_FORMAT, EXTENDED_USAGE): 2D ones needed; a 3D texture in these formats would fail to be made where 3D ones are refused (said here)
+        VkImageFormatProperties ip; const VkImageUsageFlags us = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        const VkImageCreateFlags cf = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        if (v && vkGetPhysicalDeviceImageFormatProperties(V.pd, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, us, cf | VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, &ip)) v = 0;
+        int d3 = v && !vkGetPhysicalDeviceImageFormatProperties(V.pd, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL, us, cf, &ip);
+        const char *e1 = getenv("DM_VK_BC1_ASTC"), *e7 = getenv("DM_VK_BC7_ASTC");
+        VKLOG("BC textures as ASTC 4x4: %s; BC1 (DM_VK_BC1_ASTC) %s, BC7 (DM_VK_BC7_ASTC) %s%s", v ? "the device takes them" : V.has_astc ? "off (ASTC 4x4 images not sampled, filtered and copied into here)" : "off (no ASTC)",
+              v && !(e1 && !atoi(e1)) ? "on" : "off", v && !(e7 && !atoi(e7)) ? "on" : "off", v && !d3 ? "; [RED] 3D ASTC images refused: a 3D texture in BC1 or BC7 is not made" : "");
+    }
+    return v;
+}
+static int astc_switch(const char *name) { const char *e = getenv(name); return astc_images_ok() && !(e && !atoi(e)); }
 // BC decoded on the CPU: what each BC format decodes into (dec 1 BC1 RGB, 2 BC1, 3 BC2, 4 BC3, 5 / 6 BC4 unsigned / signed, 7 / 8 BC5, 9 / 10 BC6H unsigned / signed, 11 BC7)
 static void bc_target(vkfmt_t *o) {
     int srgb = o->vk == VK_FORMAT_BC1_RGB_SRGB_BLOCK || o->vk == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || o->vk == VK_FORMAT_BC2_SRGB_BLOCK || o->vk == VK_FORMAT_BC3_SRGB_BLOCK || o->vk == VK_FORMAT_BC7_SRGB_BLOCK;
@@ -76,23 +100,32 @@ static void bc_target(vkfmt_t *o) {
     case VK_FORMAT_BC6H_SFLOAT_BLOCK: o->dec = 10; o->vk = VK_FORMAT_R16G16B16A16_SFLOAT; o->dbpp = 8; break;
     default: o->dec = 11; o->vk = rgba; o->dbpp = 4; break;   // BC7
     }
+    // astc 1: BC1 blocks rewritten as ASTC blocks; 2: decoded to RGBA8, then encoded as ASTC
+    if ((o->dec == 1 || o->dec == 2) && astc_switch("DM_VK_BC1_ASTC")) o->astc = 1;
+    else if (o->dec == 11 && astc_switch("DM_VK_BC7_ASTC")) o->astc = 2;
+    if (o->astc) { o->vk = srgb ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK; __atomic_or_fetch(&g_astc_cls, 1u << o->dec, __ATOMIC_RELAXED); }
 }
 // Decodes BC blocks (rows of whole blocks pitch bytes apart, (h + 3) / 4 rows a slice, z slices) into w x h x z texels of f->vk, rows of w * f->dbpp bytes
 static void bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) {
     // Retain the renderer's tight-output interface; the shared decoder also
     // accepts explicit row/slice pitches and buffer bounds for copy paths.
     static const uint8_t formats[] = {0, 0x41, 0x42, 0x43, 0x44, 0x49, 0x4a, 0x4b, 0x4c, 0x50, 0x4f, 0x4d};
-    if (!w || !h || !z || !f->dbpp || h > UINT32_MAX - 3 || f->dec >= sizeof formats || !formats[f->dec])
+    if (!w || !h || !z || !f->dbpp || h > UINT32_MAX - 3 || w > UINT32_MAX - 3 || f->dec >= sizeof formats || !formats[f->dec])
         die("[vk] invalid CPU BC decode dimensions or format");
+    if (f->astc == 1) { bc1_to_astc(src, pitch, (w + 3) / 4, (h + 3) / 4, z, f->dec == 1, dst); return; }   // (the caller's buffer: vk_dec_bytes)
     size_t rows = (h + 3) / 4;
     if (pitch > SIZE_MAX / rows || pitch * rows > SIZE_MAX / z ||
         (size_t)w > SIZE_MAX / f->dbpp || (size_t)w * f->dbpp > SIZE_MAX / h ||
         (size_t)w * f->dbpp * h > SIZE_MAX / z) die("[vk] CPU BC decode size overflow");
     size_t row = (size_t)w * f->dbpp, slice = pitch * rows;
+    uint8_t *out = dst;
+    if (f->astc == 2 && !(out = malloc(row * h * z))) die("[vk] CPU BC decode: no memory for %ux%ux%u texels", w, h, z);   // RGBA8 first, then ASTC into dst
     if (nvn_bc_decode(formats[f->dec], w, h, z, src, slice * z, pitch, slice,
-                      dst, row * h * z, row, row * h)) die("[vk] invalid CPU BC decode layout");
+                      out, row * h * z, row, row * h)) die("[vk] invalid CPU BC decode layout");
+    if (out != dst) { rgba_to_astc(out, w, h, z, dst); free(out); }
 }
 void vk_bc_decode(const vkfmt_t *f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) { bc_decode(f, src, pitch, w, h, z, dst); }
+size_t vk_dec_bytes(const vkfmt_t *f, uint32_t w, uint32_t h, uint32_t z) { return f->astc ? (size_t)((w + 3) / 4) * ((h + 3) / 4) * z * 16 : (size_t)w * h * z * f->dbpp; }
 static pthread_mutex_t g_fmt_mu = PTHREAD_MUTEX_INITIALIZER;
 const vkfmt_t *vk_fmt(int f) {
     if (f <= 0 || f >= 0x9D) return NULL;
@@ -120,7 +153,7 @@ const vkfmt_t *vk_fmt(int f) {
             if (o->compressed && o->vk >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && o->vk <= VK_FORMAT_BC7_SRGB_BLOCK && !V.has_bc) {
                 // no BC on the device (the Adreno 618 / 619 drivers of 2021, 512.530): an uncompressed image the CPU decodes into (bc_decode), 4 to 8 times the memory
                 VkFormat bc = o->vk; bc_target(o); o->compressed = 0;
-                VKLOG("texture format %#x (VkFormat %d): the device has no BC textures, decoded on the CPU into VkFormat %d", f, bc, o->vk);
+                VKLOG("texture format %#x (VkFormat %d): the device has no BC textures, %s on the CPU into VkFormat %d", f, bc, o->astc == 1 ? "rewritten as ASTC 4x4 blocks" : o->astc ? "decoded and encoded as ASTC 4x4" : "decoded", o->vk);
             }
             if (o->vk >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && o->vk <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK && !V.has_astc) {
                 o->kind = 0;   // said once per format: these textures went missing with nothing in the log
@@ -277,6 +310,7 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
         VKRED_ONCE(11, "image memory allocation failed (%llu bytes)", (unsigned long long)req.size); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
     VKCHK(vkBindImageMemory(V.dev, im->img, im->mem, moff));
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vk_img_mem_count(im, req.size, f->dec);
     return im;
 }
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
@@ -289,7 +323,7 @@ void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
     // a texture that builds on its previous frame: made again by the switch to docked mode, it started from leftover memory, and blocks of it stayed on the water from then on.
     // So an image starts as zeros, before an upload or a draw replaces them. Block-compressed images can't be cleared; they are always uploaded
     const vkfmt_t *f = vk_fmt(im->nvn_format);
-    if (!(im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || (f && f->compressed)) return;
+    if (!(im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) || (f && (f->compressed || f->astc))) return;
     VkImageSubresourceRange r = {im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
     if (im->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { VkClearDepthStencilValue z = {0, 0}; vkCmdClearDepthStencilImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r); }
     else { VkClearColorValue z = {{0, 0, 0, 0}}; vkCmdClearColorImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r); }
@@ -351,7 +385,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
                 size_t stride = t->d.stride ? t->d.stride : pitch;
                 for (uint32_t y = 0; y < by * z; y++) memcpy(dst + y * pitch, mem + (size_t)y * stride, pitch);
             } else if (nvn_deswizzle(&t->d, lv, ly, mem, dst, pitch)) { free(blocks); free(copy); VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return; }
-            if (blocks) { dst = vk_scratch((size_t)w * h * z * f->dbpp, 16, &sb, &so); bc_decode(f, blocks, pitch, w, h, z, dst); free(blocks); }   // (BC the device lacks)
+            if (blocks) { dst = vk_scratch(vk_dec_bytes(f, w, h, z), 16, &sb, &so); bc_decode(f, blocks, pitch, w, h, z, dst); free(blocks); }   // (BC the device lacks)
             VkBufferImageCopy r = {so, 0, 0, {im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         }
@@ -391,8 +425,14 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { if (im->bc_draw) { vkimg_t *d = im->bc_draw; vk_lrz_forget(d); vk_tex_view_drop_all(d); if (d->sub) vk_defer_free_image_sub(d->img, d->sub); else vk_defer_free_image(d->img, d->mem); free(d); }
-    vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+// Device memory of the images live, by what they hold: [0] formats the device has (render targets among them), [dec] a BC format decoded on the CPU (bc_target), whose
+// image is 2 to 8 times the guest's blocks. The images line counts the guest's bytes; this counts the device's (on Mali-G720, Pokemon Legends Z-A's 470 MB of textures)
+static uint64_t g_imem[12];
+void vk_img_mem_count(vkimg_t *im, uint64_t size, int cls) { im->msize = size; im->mcls = (uint8_t)(cls >= 0 && cls < 12 ? cls : 0); __atomic_add_fetch(&g_imem[im->mcls], size, __ATOMIC_RELAXED); }
+static void img_mem_forget(vkimg_t *im) { if (im->msize) __atomic_sub_fetch(&g_imem[im->mcls], im->msize, __ATOMIC_RELAXED); im->msize = 0; }
+uint64_t vk_img_mem_bytes(void) { uint64_t n = 0; for (int i = 0; i < 12; i++) n += __atomic_load_n(&g_imem[i], __ATOMIC_RELAXED); return n; }
+static void img_drop(vkimg_t *im) { if (im->bc_draw) { vkimg_t *d = im->bc_draw; img_mem_forget(d); vk_lrz_forget(d); vk_tex_view_drop_all(d); if (d->sub) vk_defer_free_image_sub(d->img, d->sub); else vk_defer_free_image(d->img, d->mem); free(d); }
+    img_mem_forget(im); vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -493,9 +533,21 @@ void vk_tex_sweep(void) {
     pthread_mutex_unlock(&g_img_mu);
     free(v);
     static uint64_t total; total += idle + lru;
-    if (g_tex_frame % 3000 == 0) VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory)", (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted);
+    if (g_tex_frame % 3000 == 0) {
+        VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory)", (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted);
+        char b[512]; uint64_t bb, bu, bf; vk_imgblk_stats(&bb, &bu, &bf); vk_img_mem_formats(b, sizeof b);
+        VKLOG("image memory: %.0f MB on the device (MB by format: %s); shared blocks %.0f MB, %.0f MB of it in use, %llu blocks given back so far",
+              vk_img_mem_bytes() / 1048576.0, b, bb / 1048576.0, bu / 1048576.0, (unsigned long long)bf);
+    }
     if ((idle || lru) && (g_tex_frame % 3000 == 0 || lru)) VKLOG("packaged textures: %llu not drawn for %d presents and %llu least recently drawn released their write protection (%llu pages; %llu so far); %d protected runs",
                     (unsigned long long)idle, PKG_IDLE, (unsigned long long)lru, (unsigned long long)(nvn_dirty_released() - before), (unsigned long long)total, runs);
+}
+void vk_img_mem_formats(char *b, size_t n) {   // "other 310, BC1 as ASTC 90, BC7 400, ..." (MB; classes under 1 MB left out)
+    static const char *const NAME[12] = {"other", "BC1 RGB", "BC1", "BC2", "BC3", "BC4", "BC4 signed", "BC5", "BC5 signed", "BC6H", "BC6H signed", "BC7"};
+    uint32_t astc = __atomic_load_n(&g_astc_cls, __ATOMIC_RELAXED); size_t o = 0; b[0] = 0;
+    for (int i = 0; i < 12 && o + 48 < n; i++) { uint64_t m = __atomic_load_n(&g_imem[i], __ATOMIC_RELAXED);
+        if (m >= (1 << 20)) o += (size_t)snprintf(b + o, n - o, "%s%s%s %.0f", o ? ", " : "", NAME[i], astc >> i & 1 ? " as ASTC" : "", m / 1048576.0); }
+    if (!o) snprintf(b, n, "none");
 }
 // The keys are gathered first, 64 a pass, then deleted (a delete rehashes the table): a rescan from the start after each delete went over the whole table once per image,
 // under the lock the replay's texture lookups take, for each of the pools Pokémon Scarlet drops while a capture loads
@@ -749,7 +801,7 @@ VkImageView vk_tex_view_as(const tex_t *t, const view_t *vw, int dim, int arraye
     // BC3 format by the rule below, the attachment was a compressed view, which nothing can draw into: the Mii maker's alternative-face tiles stayed blank (Odin 3, 2026-11-14)
     int block_view = as_attachment && (im->cflags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) && imf && imf->compressed && !imf->dec &&
                      !f->compressed && !f->dec && f->bpb == imf->bpb && nlv == 1 && nly == 1;
-    if (!block_view && ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (imf->compressed || imf->dec) || (f->dec && f->dbpp != imf->dbpp))) fmt = im->fmt;   // depth views and block-size changes keep the image's format
+    if (!block_view && ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (imf->compressed || imf->dec) || (f->dec && (f->dbpp != imf->dbpp || f->astc != imf->astc)))) fmt = im->fmt;   // depth views and block-size changes keep the image's format
     // a storage view in the integer class of the shader's declaration (vfmt, the caller's texel size): identity swizzle, as an image takes no channel mapping. Only where the
     // image allows it: its format list (fixed_fmt) names it, else the image is MUTABLE_FORMAT
     if (vfmt && !as_attachment && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && (!im->fixed_fmt || vfmt == im->fmt_cls[0] || vfmt == im->fmt_cls[1])) { fmt = vfmt; swz = (VkComponentMapping){0}; }
