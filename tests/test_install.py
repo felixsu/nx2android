@@ -124,6 +124,20 @@ class RomfsAt(unittest.TestCase):
         self.assertIsNone(install.device_romfs('DM_LANG=en-US\nDM_ROMFS=/sdcard/copy\n'))
         self.assertEqual(install.device_romfs(install.env_with_romfs(env, '/sdcard/b')), '/sdcard/b')   # the last one, as the app applies them
 
+    def test_cloud_url(self):   # the game library's cloud-saves row: written last, kept by a later install without --cloud-url, removed by --cloud-url ''; checked first
+        url = 'https://library.example.ts.net/api/saves/0100000000AAA000'
+        dev = self.run_on(Device({}), cloud_url=url)
+        env = dev.text[f'{FILES}/env.txt']
+        self.assertTrue(env.endswith(f'\nDM_CLOUD_URL={url}\n')); self.assertIn('DM_LANG=en-US', env); self.assertEqual(install.device_cloud_url(env), url)
+        again = self.run_on(Device({}, text={f'{FILES}/env.txt': env}))
+        self.assertEqual(install.device_cloud_url(again.text[f'{FILES}/env.txt']), url)
+        both = self.run_on(Device({**{f'{DUMP}/{r}': n for r, n in ROM.items()}}, text={f'{FILES}/env.txt': env}), romfs_at=DUMP)
+        self.assertEqual(install.device_romfs(both.text[f'{FILES}/env.txt']), DUMP); self.assertEqual(install.device_cloud_url(both.text[f'{FILES}/env.txt']), url)
+        off = self.run_on(Device({}, text={f'{FILES}/env.txt': env}), cloud_url='')
+        self.assertIsNone(install.device_cloud_url(off.text.get(f'{FILES}/env.txt', '')))
+        for bad in ('ftp://x', 'https://a b', 'library.local/api'):
+            with self.assertRaises(BuildError, msg=bad): install.install(self.apk, self.data, 'adb', cloud_url=bad)
+
     def test_mismatch(self):   # the first differences of each kind, with sizes; nothing for the same listing
         self.assertEqual(install.romfs_mismatch(DUMP, ROM, dict(ROM)), '')
         msg = install.romfs_mismatch(DUMP, ROM, {'Data/a.bin': 21, 'c.bin': 5, 'x.bin': 1, 'y.bin': 1}, n=1)

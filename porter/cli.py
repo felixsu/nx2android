@@ -58,6 +58,8 @@ def _parser():
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
     ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
     ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
+    ins.add_argument('--cloud-url', default=None, help='the game library\'s cloud-saves endpoint for this game (https://<library>/api/saves/<TITLEID>): the pause menu\'s Saves page '
+                     'uploads and downloads the save there. Later installs keep it; "" turns cloud saves off')
     _romfs_at(ins)
     dv = sub.add_parser('devices', help='the devices adb sees'); dv.add_argument('--json', action='store_true')
     t = sub.add_parser('tools', help='list, or download, the missing tools (Android NDK, .NET SDK, platform-tools) from Google and Microsoft')
@@ -184,7 +186,8 @@ def cmd_install(a):
         apk = Path(a.apk) if a.apk else data.with_name(data.name.removesuffix('-data') + '.apk')
         PROG.plan(1)
         cfg = config.load()
-        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer, romfs_at=a.romfs_at, romfs_push=a.romfs_push)
+        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer, romfs_at=a.romfs_at, romfs_push=a.romfs_push,
+                        cloud_url=a.cloud_url)
     return _with_progress(a.progress, go)
 
 

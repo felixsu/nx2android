@@ -14,6 +14,7 @@
 #include "stick_axis.h"
 #include "pixel_font.h"
 #include "saves_android.h"
+#include "cloud_android.h"
 #include <math.h>
 #include <time.h>
 #include <android/asset_manager.h>
@@ -726,14 +727,21 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
     else if (bit == DM_BTN_B || bit == DM_BTN_PLUS) menu_close();
 }
 
-// ---- the save manager (saves_android.c): Export save copies the game's committed save to the files folder's saves/ on a thread of its own (the row shows it
-// copying, then the export's name); Import save opens the picker, in the menu's panel (overlay_layout.h OVS_*): the saves there newest first, a page of
-// OVM_ROWS - 2 (left and right, L and R page), Back. A save chosen asks first; the import then waits for the next start (the save is not touched while the
-// game runs) and the app ends, as the panel says. A controller: up and down choose, A does, B goes back; a finger taps a row, or outside the panel to go back ----
+// ---- the save manager (saves_android.c) and cloud saves (cloud_android.c): Export save copies the game's committed save to the files folder's saves/ on a
+// thread of its own (the row shows it copying, then the export's name). Saves & cloud opens a page in the menu's panel (overlay_layout.h OVS_*), the hub:
+//   Import a save   the picker: the saves in saves/ newest first, a page of OVM_ROWS - 2 (left and right, L and R page); a save chosen asks first; the
+//                   import then waits for the next start (the save is not touched while the game runs) and the app ends, as the panel says
+//   Upload to cloud / Download from cloud   the game library's cloud (DM_CLOUD_URL): where the save stands is checked as the page opens; when the other side
+//                   has a save this one has not seen, a page asks: keep this phone's save, or override it from the cloud (this phone's is backed up first:
+//                   saves/<stamp>-before-cloud, the newest 5). A download is imported at the next start, as an import is, and the app ends
+// A controller: up and down choose, A does, B goes back; a finger taps a row, or outside the panel to go back ----
 #define SP_MAX 64
 #define SP_PER (OVM_ROWS - 2)
-static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER;   // the picker's list and the export's note
-static struct { int n, page, confirm, closing, ptr, row; dm_save_entry e[SP_MAX], pick; } g_sp = {.ptr = -1};
+enum { SPV_HUB, SPV_LIST, SPV_CONFIRM, SPV_CLOSING, SPV_ASK };   // the page: the hub, the picker, an import's confirmation, the note that the app ends, the cloud's question
+enum { CLB_IDLE, CLB_CHECK, CLB_UP, CLB_DOWN };                   // what the cloud's thread is doing
+static pthread_mutex_t g_sp_mu = PTHREAD_MUTEX_INITIALIZER;   // the picker's list, the cloud's state and the export's note
+static struct { int n, page, view, cloud_close, ptr, row, gen; dm_save_entry e[SP_MAX], pick; } g_sp = {.ptr = -1};
+static struct { int busy, have, ask_up; dm_cloud_status st; char note[2][80]; } g_cl;   // ask_up: the question is the upload's (else the download's)
 static char g_sv_note[96];
 int dm_save_note(char *out, int cap) { pthread_mutex_lock(&g_sp_mu); snprintf(out, (size_t)cap, "%s", g_sv_note); pthread_mutex_unlock(&g_sp_mu); return atomic_load(&g_sv_st); }
 static void *export_run(void *a) {
@@ -750,21 +758,113 @@ static void sp_changed(void) { atomic_fetch_add(&g_sp_ver, 1); dm_overlay_redraw
 static int sp_on_page(void) { int k = g_sp.n - g_sp.page * SP_PER; return k < 0 ? 0 : k > SP_PER ? SP_PER : k; }   // the caller holds g_sp_mu
 static int sp_selectable(int row) {   // the rows a controller and a finger can choose
     pthread_mutex_lock(&g_sp_mu);
-    int ok = g_sp.closing ? 0 : g_sp.confirm ? row == OVM_ROWS - 2 || row == OVM_ROWS - 1 : (row >= 1 && row <= sp_on_page()) || row == OVM_ROWS - 1;
+    int v = g_sp.view, cloud = dm_cloud_url() && g_cl.busy == CLB_IDLE, ok;
+    if (v == SPV_CLOSING) ok = 0;
+    else if (v == SPV_HUB) ok = row == 1 || ((row == 2 || row == 3) && cloud) || row == OVM_ROWS - 1;
+    else if (v == SPV_ASK) ok = ((row == 3 || row == 4) && g_cl.busy == CLB_IDLE) || row == OVM_ROWS - 1;
+    else if (v == SPV_CONFIRM) ok = row == OVM_ROWS - 2 || row == OVM_ROWS - 1;
+    else ok = (row >= 1 && row <= sp_on_page()) || row == OVM_ROWS - 1;
     pthread_mutex_unlock(&g_sp_mu); return ok;
 }
-static void sp_open(void) {
-    pthread_mutex_lock(&g_sp_mu);
-    int n = g_sp.n = dm_saves_list(g_sp.e, SP_MAX); g_sp.page = g_sp.confirm = g_sp.closing = 0; g_sp.ptr = -1;
-    pthread_mutex_unlock(&g_sp_mu);
-    atomic_store(&g_sp_hi, n ? 1 : OVM_ROWS - 1); atomic_store(&g_sp_on, 1); sp_changed();
-    LOG("[saves] picker opened: %d saves in %s", n, dm_saves_dir());
+static const char *const CL_STATE[] = {"no saves yet", "not in the cloud", "only in the cloud", "in sync", "phone is newer", "cloud is newer", "both changed"};
+static void cl_ago(long long ms, char *out, int cap) {
+    long long d = (long long)time(NULL) - ms / 1000;
+    if (d < 60) snprintf(out, (size_t)cap, "just now"); else if (d < 3600) snprintf(out, (size_t)cap, "%lld min ago", d / 60);
+    else if (d < 86400) snprintf(out, (size_t)cap, "%lld h ago", d / 3600); else snprintf(out, (size_t)cap, "%lld days ago", d / 86400);
 }
-static void sp_back(void) {   // the confirmation → the list → the menu (nothing once the import is under way)
-    pthread_mutex_lock(&g_sp_mu); int closing = g_sp.closing, confirm = g_sp.confirm; if (!closing) g_sp.confirm = 0; g_sp.ptr = -1; pthread_mutex_unlock(&g_sp_mu);
-    if (closing) return;
+static void cl_who(const dm_cloud_save *s, char *out, int cap) {   // "Felixs-Mac, 2 h ago"; the caller holds g_sp_mu
+    char a[32]; cl_ago(s->uploaded_ms, a, sizeof a); snprintf(out, (size_t)cap, "%.40s, %s", s->device[0] ? s->device : s->platform, a);
+}
+static void cl_describe(void) {   // the hub's two note lines from the last check; the caller holds g_sp_mu
+    char who[64] = ""; if (g_cl.st.has_latest) cl_who(&g_cl.st.latest, who, sizeof who);
+    g_cl.note[1][0] = 0;
+    switch (g_cl.st.state) {
+    case DMC_BOTH_EMPTY: snprintf(g_cl.note[0], sizeof g_cl.note[0], "Neither this phone nor the cloud has a save yet."); break;
+    case DMC_CLOUD_EMPTY: snprintf(g_cl.note[0], sizeof g_cl.note[0], "This phone's save is not in the cloud yet."); break;
+    case DMC_LOCAL_EMPTY: snprintf(g_cl.note[0], sizeof g_cl.note[0], "The cloud has a save (%s).", who); break;
+    case DMC_IN_SYNC: snprintf(g_cl.note[0], sizeof g_cl.note[0], "This phone has the newest cloud save."); break;
+    case DMC_LOCAL_NEWER: snprintf(g_cl.note[0], sizeof g_cl.note[0], "This phone has progress the cloud has not seen."); break;
+    case DMC_CLOUD_NEWER: snprintf(g_cl.note[0], sizeof g_cl.note[0], "The cloud has a newer save (%s).", who); break;
+    default: snprintf(g_cl.note[0], sizeof g_cl.note[0], "This phone and the cloud both changed"); snprintf(g_cl.note[1], sizeof g_cl.note[1], "(cloud: %s).", who);
+    }
+}
+static void cl_error(const char *err) {   // the caller holds g_sp_mu: the error over the two note lines
+    size_t L = strlen(err), cut = L < sizeof g_cl.note[0] - 1 ? L : sizeof g_cl.note[0] - 1;
+    if (L > cut) { size_t sp = cut; while (sp > 40 && err[sp] != ' ') sp--; if (err[sp] == ' ') cut = sp; }
+    snprintf(g_cl.note[0], sizeof g_cl.note[0], "%.*s", (int)cut, err); snprintf(g_cl.note[1], sizeof g_cl.note[1], "%s", err + cut + (err[cut] == ' '));
+}
+typedef struct { int what, force, gen; } cl_job;
+static void *sp_end(void *a);
+static void *cl_run(void *a) {   // the cloud's thread: a check, an upload or a download (cloud_android.c blocks), then the page shows the outcome
+    cl_job j = *(cl_job *)a; free(a);
+    char err[300] = ""; dm_cloud_status st; int r = dm_cloud_check(&st, err, sizeof err);
+    pthread_mutex_lock(&g_sp_mu);
+    int live = g_sp.gen == j.gen && atomic_load(&g_sp_on);
+    if (!r) { g_cl.st = st; g_cl.have = 1; }
+    if (r || j.what == CLB_CHECK) { if (r) cl_error(err); else cl_describe(); if (r && live && g_sp.view == SPV_ASK) { g_sp.view = SPV_HUB; atomic_store(&g_sp_hi, 1); } g_cl.busy = CLB_IDLE; pthread_mutex_unlock(&g_sp_mu); sp_changed(); return NULL; }
+    int up = j.what == CLB_UP, ask = up ? dm_cloud_upload_asks(st.state) : dm_cloud_download_asks(st.state);
+    if (ask && !j.force) {   // the other side has something this one has not seen: ask
+        if (live) { g_sp.view = SPV_ASK; g_cl.ask_up = up; atomic_store(&g_sp_hi, 3); }
+        g_cl.busy = CLB_IDLE; pthread_mutex_unlock(&g_sp_mu); sp_changed(); return NULL;
+    }
+    if (st.state == DMC_IN_SYNC || (up && (st.state == DMC_LOCAL_EMPTY || st.state == DMC_BOTH_EMPTY)) || (!up && (st.state == DMC_CLOUD_EMPTY || st.state == DMC_BOTH_EMPTY))) {
+        cl_describe();
+        if (st.state != DMC_IN_SYNC) snprintf(g_cl.note[1], sizeof g_cl.note[1], up ? "Nothing to upload: the game has not saved yet." : "Nothing to download.");
+        if (live && g_sp.view == SPV_ASK) { g_sp.view = SPV_HUB; atomic_store(&g_sp_hi, 1); }
+        g_cl.busy = CLB_IDLE; pthread_mutex_unlock(&g_sp_mu); sp_changed(); return NULL;
+    }
+    dm_cloud_save latest = st.latest;
+    pthread_mutex_unlock(&g_sp_mu);
+    if (up) {
+        dm_cloud_save saved; r = dm_cloud_upload(&saved, err, sizeof err);
+        pthread_mutex_lock(&g_sp_mu);
+        if (r) cl_error(err);
+        else { g_cl.st.state = DMC_IN_SYNC; g_cl.st.latest = saved; g_cl.st.has_latest = 1; snprintf(g_cl.st.base, sizeof g_cl.st.base, "%s", saved.hash);
+            snprintf(g_cl.note[0], sizeof g_cl.note[0], "Uploaded this phone's save to the cloud."); g_cl.note[1][0] = 0; }
+        if (live && g_sp.view == SPV_ASK) { g_sp.view = SPV_HUB; atomic_store(&g_sp_hi, 2); }
+        g_cl.busy = CLB_IDLE; pthread_mutex_unlock(&g_sp_mu); sp_changed(); return NULL;
+    }
+    char name[64]; r = dm_cloud_download(&latest, name, sizeof name, err, sizeof err);
+    pthread_mutex_lock(&g_sp_mu);
+    g_cl.busy = CLB_IDLE;
+    if (r) { cl_error(err); if (live && g_sp.view == SPV_ASK) { g_sp.view = SPV_HUB; atomic_store(&g_sp_hi, 3); } pthread_mutex_unlock(&g_sp_mu); sp_changed(); return NULL; }
+    g_sp.view = SPV_CLOSING; g_sp.cloud_close = 1; cl_who(&latest, g_cl.note[0], sizeof g_cl.note[0]);
+    pthread_mutex_unlock(&g_sp_mu);
+    atomic_store(&g_sp_on, 1); atomic_store(&g_sp_hi, -1); sp_changed();
+    pthread_t t; if (pthread_create(&t, NULL, sp_end, NULL)) sp_end(NULL); else pthread_detach(t);
+    return NULL;
+}
+static void cl_start(int what, int force) {   // the caller does not hold g_sp_mu
+    if (!dm_cloud_url()) return;
+    pthread_mutex_lock(&g_sp_mu);
+    if (g_cl.busy != CLB_IDLE) { pthread_mutex_unlock(&g_sp_mu); return; }
+    g_cl.busy = what; int gen = g_sp.gen;
+    pthread_mutex_unlock(&g_sp_mu);
+    cl_job *j = malloc(sizeof *j); pthread_t t;
+    if (!j || (j->what = what, j->force = force, j->gen = gen, pthread_create(&t, NULL, cl_run, j))) {
+        free(j); pthread_mutex_lock(&g_sp_mu); g_cl.busy = CLB_IDLE; cl_error("cannot start the network thread"); pthread_mutex_unlock(&g_sp_mu);
+    } else pthread_detach(t);
+    sp_changed();
+}
+static void sp_open(void) {   // the hub; where the save stands against the cloud is checked as it opens
+    pthread_mutex_lock(&g_sp_mu);
+    int n = g_sp.n = dm_saves_list(g_sp.e, SP_MAX); g_sp.page = g_sp.cloud_close = 0; g_sp.view = SPV_HUB; g_sp.ptr = -1; g_sp.gen++;
+    if (!dm_cloud_url()) { snprintf(g_cl.note[0], sizeof g_cl.note[0], "Cloud saves: install the game from the game library"); snprintf(g_cl.note[1], sizeof g_cl.note[1], "(it sets the library's address on the phone)."); }
+    else if (g_cl.busy == CLB_IDLE) { g_cl.note[0][0] = g_cl.note[1][0] = 0; }
+    pthread_mutex_unlock(&g_sp_mu);
+    atomic_store(&g_sp_hi, 1); atomic_store(&g_sp_on, 1); sp_changed();
+    LOG("[saves] saves page opened: %d saves in %s, cloud %s", n, dm_saves_dir(), dm_cloud_url() ? dm_cloud_url() : "off");
+    cl_start(CLB_CHECK, 0);
+}
+static void sp_back(void) {   // the confirmation → the list → the hub → the menu; the cloud's question → the hub (nothing once the app is ending)
+    pthread_mutex_lock(&g_sp_mu); int v = g_sp.view; g_sp.ptr = -1;
+    if (v == SPV_CONFIRM) g_sp.view = SPV_LIST; else if (v == SPV_LIST || v == SPV_ASK) g_sp.view = SPV_HUB;
+    if (v == SPV_ASK) { snprintf(g_cl.note[0], sizeof g_cl.note[0], "Nothing was changed."); g_cl.note[1][0] = 0; }
+    pthread_mutex_unlock(&g_sp_mu);
+    if (v == SPV_CLOSING) return;
     dm_haptics_android_tap();
-    if (confirm) { atomic_store(&g_sp_hi, 1); sp_changed(); return; }
+    if (v != SPV_HUB) { atomic_store(&g_sp_hi, v == SPV_ASK ? 3 : 1); sp_changed(); return; }
+    pthread_mutex_lock(&g_sp_mu); g_sp.gen++; pthread_mutex_unlock(&g_sp_mu);   // a check still running no longer changes the page
     atomic_store(&g_sp_on, 0); atomic_store(&g_menu_hi, -1); dm_overlay_redraw();
 }
 static void *sp_end(void *a) {   // the panel's note shows for a moment, then the app ends; the next start imports the save (saves_android.c dm_saves_start)
@@ -775,16 +875,29 @@ static void sp_do(int row) {
     dm_haptics_android_tap();
     if (row == OVM_ROWS - 1) { sp_back(); return; }
     pthread_mutex_lock(&g_sp_mu);
-    if (!g_sp.confirm) { g_sp.pick = g_sp.e[g_sp.page * SP_PER + row - 1]; g_sp.confirm = 1; pthread_mutex_unlock(&g_sp_mu); atomic_store(&g_sp_hi, OVM_ROWS - 2); sp_changed(); return; }
+    int v = g_sp.view;
+    if (v == SPV_HUB) {
+        if (row == 1) { g_sp.n = dm_saves_list(g_sp.e, SP_MAX); g_sp.page = 0; g_sp.view = SPV_LIST; pthread_mutex_unlock(&g_sp_mu); atomic_store(&g_sp_hi, g_sp.n ? 1 : OVM_ROWS - 1); sp_changed(); return; }
+        pthread_mutex_unlock(&g_sp_mu); cl_start(row == 2 ? CLB_UP : CLB_DOWN, 0); return;
+    }
+    if (v == SPV_ASK) {
+        int up = g_cl.ask_up;
+        if (row == 3 && !up) {   // keep this phone's save: nothing to download
+            g_sp.view = SPV_HUB; snprintf(g_cl.note[0], sizeof g_cl.note[0], "Kept this phone's save."); g_cl.note[1][0] = 0;
+            pthread_mutex_unlock(&g_sp_mu); atomic_store(&g_sp_hi, 2); sp_changed(); return;
+        }
+        pthread_mutex_unlock(&g_sp_mu); cl_start(row == 3 ? CLB_UP : CLB_DOWN, 1); return;   // keep and upload it; or override from the cloud
+    }
+    if (v == SPV_LIST) { g_sp.pick = g_sp.e[g_sp.page * SP_PER + row - 1]; g_sp.view = SPV_CONFIRM; pthread_mutex_unlock(&g_sp_mu); atomic_store(&g_sp_hi, OVM_ROWS - 2); sp_changed(); return; }
     char name[64]; snprintf(name, sizeof name, "%s", g_sp.pick.name);
     pthread_mutex_unlock(&g_sp_mu);
     if (dm_saves_request_import(name)) return;
-    pthread_mutex_lock(&g_sp_mu); g_sp.closing = 1; pthread_mutex_unlock(&g_sp_mu);
+    pthread_mutex_lock(&g_sp_mu); g_sp.view = SPV_CLOSING; g_sp.cloud_close = 0; pthread_mutex_unlock(&g_sp_mu);
     atomic_store(&g_sp_hi, -1); sp_changed();
     pthread_t t; if (pthread_create(&t, NULL, sp_end, NULL)) sp_end(NULL); else pthread_detach(t);
 }
 static void sp_page(int d) {
-    pthread_mutex_lock(&g_sp_mu); int pages = (g_sp.n + SP_PER - 1) / SP_PER, p = g_sp.page + d, ok = !g_sp.confirm && !g_sp.closing && p >= 0 && p < pages;
+    pthread_mutex_lock(&g_sp_mu); int pages = (g_sp.n + SP_PER - 1) / SP_PER, p = g_sp.page + d, ok = g_sp.view == SPV_LIST && p >= 0 && p < pages;
     if (ok) g_sp.page = p;
     int k = sp_on_page(); pthread_mutex_unlock(&g_sp_mu);
     if (!ok) return;
@@ -823,13 +936,35 @@ int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
     if (!atomic_load(&g_sp_on)) return 0;
     memset(rows, 0, sizeof(ov_srow) * OVM_ROWS);
     pthread_mutex_lock(&g_sp_mu);
-    if (g_sp.closing) {
+    int v = g_sp.view, cloud = dm_cloud_url() != NULL; char who[64] = ""; if (g_cl.st.has_latest) cl_who(&g_cl.st.latest, who, sizeof who);
+    if (v == SPV_CLOSING && g_sp.cloud_close) {
+        SP_ROW(0, OVS_TITLE, "Downloaded the cloud save"); SP_ROW(1, OVS_ITEM, "%s", g_cl.note[0]);
+        SP_ROW(2, OVS_NOTE, "The game closes now. Open it again:"); SP_ROW(3, OVS_NOTE, "the cloud save is put in as it starts,"); SP_ROW(4, OVS_NOTE, "after this phone's save is backed up.");
+    } else if (v == SPV_CLOSING) {
         SP_ROW(0, OVS_TITLE, "Importing the save"); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
         SP_ROW(2, OVS_NOTE, "The game closes now. Open it again:"); SP_ROW(3, OVS_NOTE, "the save is imported as it starts.");
-    } else if (g_sp.confirm) {
+    } else if (v == SPV_CONFIRM) {
         SP_ROW(0, OVS_TITLE, "Import this save?"); SP_ROW(1, OVS_ITEM, "%s", g_sp.pick.name); sp_size(rows[1].right, sizeof rows[1].right, &g_sp.pick);
         SP_ROW(2, OVS_NOTE, "Your current save is exported first,"); SP_ROW(3, OVS_NOTE, "then the game closes: open it again.");
         SP_ROW(OVM_ROWS - 2, OVS_BUTTON, "Import and close"); SP_ROW(OVM_ROWS - 1, OVS_BACK, "Cancel");
+    } else if (v == SPV_ASK) {
+        int up = g_cl.ask_up, both = g_cl.st.state == DMC_CONFLICT;
+        SP_ROW(0, OVS_TITLE, "%s", both ? "Both saves changed" : up ? "The cloud has a newer save" : "This phone has newer progress");
+        SP_ROW(1, OVS_NOTE, "Cloud: %s", who);
+        SP_ROW(2, OVS_NOTE, "Overriding backs this phone's save up first.");
+        SP_ROW(3, OVS_ITEM, "Keep this phone's save"); if (up) snprintf(rows[3].right, sizeof rows[3].right, g_cl.busy == CLB_UP ? "uploading..." : "and upload it");
+        SP_ROW(4, OVS_ITEM, "Override from cloud"); snprintf(rows[4].right, sizeof rows[4].right, g_cl.busy == CLB_DOWN ? "downloading..." : "the game closes");
+        SP_ROW(OVM_ROWS - 1, OVS_BACK, "Cancel");
+    } else if (v == SPV_HUB) {
+        SP_ROW(0, OVS_TITLE, "Saves");
+        snprintf(rows[0].right, sizeof rows[0].right, "%s", !cloud ? "cloud off" : g_cl.busy == CLB_CHECK ? "checking the cloud..." : g_cl.have ? CL_STATE[g_cl.st.state] : "");
+        SP_ROW(1, OVS_ITEM, "Import a save"); snprintf(rows[1].right, sizeof rows[1].right, "%d in saves/", g_sp.n);
+        SP_ROW(2, OVS_ITEM, "Upload to cloud"); if (g_cl.busy == CLB_UP) snprintf(rows[2].right, sizeof rows[2].right, "uploading...");
+        SP_ROW(3, OVS_ITEM, "Download from cloud");
+        snprintf(rows[3].right, sizeof rows[3].right, "%s", g_cl.busy == CLB_DOWN ? "downloading..." : g_cl.have && g_cl.st.has_latest ? who : "");
+        if (g_cl.note[0][0]) SP_ROW(4, OVS_NOTE, "%s", g_cl.note[0]);
+        if (g_cl.note[1][0]) SP_ROW(5, OVS_NOTE, "%s", g_cl.note[1]);
+        SP_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
     } else {
         int pages = (g_sp.n + SP_PER - 1) / SP_PER, k = sp_on_page();
         SP_ROW(0, OVS_TITLE, "Import a save"); if (pages > 1) snprintf(rows[0].right, sizeof rows[0].right, "page %d of %d", g_sp.page + 1, pages);
@@ -1449,7 +1584,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
-    g_vm = act->vm;
+    g_vm = act->vm; dm_cloud_start(act->vm);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);

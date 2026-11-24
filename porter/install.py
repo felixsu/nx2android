@@ -24,6 +24,7 @@ APP = 'app'                                                  # --romfs-at app: t
 NO_SD = 'no-sd'                                              # --romfs-at no-sd: the RomFS back in the app's files folder when an earlier --romfs-at sd install put it on the SD card; otherwise as without --romfs-at
 SD = 'sd'                                                    # --romfs-at sd: the RomFS in <the SD card>/Android/data/<package>/files/RomFS, pushed there: Android deletes that folder when the app is uninstalled (the APK stays in internal storage: Android 13 installs apps only to an adopted SD card)
 ROMFS_MARK = '# porter install --romfs-at'                  # in the device's env.txt: the DM_ROMFS row under it is the installer's, carried over by later installs
+CLOUD_MARK = '# porter install --cloud-url'                 # in the device's env.txt: the DM_CLOUD_URL row under it (the game library's cloud saves), carried over too
 ACCESS = 'android.permission.MANAGE_EXTERNAL_STORAGE'        # All files access, which the APK asks for (mkapk.py) and the installer grants
 ACCESS_HOW = 'Settings > Apps > {name} > All files access (Android 10: Permissions > Files and media)'
 SAMPLE_FILES, SAMPLE_MAX = 256, 4 << 20                      # the folder's content check: up to this many of its files, each of at most this many bytes (romfs_sample)
@@ -63,6 +64,24 @@ def device_romfs(env_text):   # the folder an earlier --romfs-at install wrote i
 
 def env_with_romfs(pack_env, folder):   # the pack's env.txt with the installer's row last: the app applies the rows in order (front_android.c env_file), so it wins
     return pack_env.rstrip('\n') + f'\n{ROMFS_MARK}: the game\'s RomFS is read from this folder (later installs keep it; --romfs-at app moves it into the files folder)\nDM_ROMFS={folder}\n'
+
+
+def device_cloud_url(env_text):   # the cloud-saves endpoint an earlier --cloud-url install wrote into the device's env.txt, None when there is none
+    lines, out = env_text.splitlines(), None
+    for prev, ln in zip([''] + lines, lines):
+        if prev.startswith(CLOUD_MARK) and ln.startswith('DM_CLOUD_URL='): out = ln[len('DM_CLOUD_URL='):].rstrip() or None
+    return out
+
+
+def env_with_cloud(env, url):   # env.txt with the cloud-saves row last (nxnative/dm/android/cloud_android.c reads DM_CLOUD_URL)
+    return env.rstrip('\n') + f'\n{CLOUD_MARK}: the pause menu\'s cloud saves talk to this game library endpoint (later installs keep it)\nDM_CLOUD_URL={url}\n'
+
+
+def cloud_url_check(url):   # --cloud-url: an http(s) URL on one line, '' turns cloud saves off
+    if url is None or url == '': return url
+    if not re.fullmatch(r'https?://[^\s]+', url) or len(url) > 400:
+        raise BuildError(f'--cloud-url takes the game library\'s http(s) endpoint for the game (https://<library>/api/saves/<TITLEID>), or "" to turn cloud saves off: {url!r}')
+    return url.rstrip('/')
 
 
 def romfs_diff(want, have):   # want, have: {path in the RomFS: size} → (missing, of another size, not the game's), each sorted
@@ -149,10 +168,12 @@ def apk_asks_access(apk):   # whether the APK asks for All files access: one mad
     return ACCESS.encode('utf-16-le') in m or ACCESS.encode() in m
 
 
-def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None, romfs_push=False):
+def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None, romfs_push=False, cloud_url=None):
     """romfs_at: a folder on the device that holds the game's RomFS (romfs_push: push the pack's RomFS into it first), 'app' for the app's files folder, None: as the
-    device has it (an earlier --romfs-at install's folder, else the files folder)"""
+    device has it (an earlier --romfs-at install's folder, else the files folder). cloud_url: the game library's cloud-saves endpoint for the game (env.txt's
+    DM_CLOUD_URL), '' none, None: as the device has it"""
     apk, data = Path(apk), Path(data)
+    cloud_url = cloud_url_check(cloud_url)
     man = datapack.read_manifest(data)
     if not man: raise BuildError(f'not a data pack (no {datapack.MANIFEST}): {data}')
     if not apk.is_file(): raise BuildError(f'no APK: {apk}')
@@ -180,6 +201,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             romfs_at = f'{vol}/Android/data/{man["package"]}/files/{datapack.ROMFS}'; target = romfs_target(romfs_at, files); romfs_push = True
             say(f'RomFS on the SD card (the first mounted portable volume, an SD card before a USB drive): {target}')
         dev_env = adb.read_text(f'{files}/env.txt') or ''
+        cloud = (device_cloud_url(dev_env) if cloud_url is None else cloud_url) or None   # the cloud-saves row, carried over when not given
         was = device_romfs(dev_env)   # an earlier --romfs-at install's folder
         sd_dir = card_folder(was, man['package'])   # the folder an earlier --romfs-at sd made
         if sd_dir: was = posixpath.normpath(was)
@@ -254,7 +276,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
         if not target and seed_from_sibling(adb, man, files, have, data): have = adb.remote_sizes(files)   # another port of the game on the device gives its RomFS / DLC
         PROG.set(step='pushing the game data')
-        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,) + (('env.txt',) if target else ()), exclude=(datapack.ROMFS,) if target else (),
+        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,) + (('env.txt',) if target or cloud else ()), exclude=(datapack.ROMFS,) if target else (),
                       verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
                       progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=have)
         if own and extra:   # files of an older game version in the installer's own card folder, which the game would still find
@@ -266,10 +288,14 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             adb.push_tree(data / datapack.ROMFS, target, verify=lambda rel: rel in again, progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=there)
             now = adb.remote_sizes(target)
             if bad := romfs_mismatch(target, rom, now, changed=romfs_changed(adb, data, target, rom, now) or []): raise BuildError(f'after the push, {bad}')
-        if target:   # the pack's env.txt with the installer's row
+        if target or cloud:   # the pack's env.txt with the installer's rows
             with tempfile.TemporaryDirectory(prefix='nx2a_env_') as t:
-                env = Path(t) / 'env.txt'; env.write_text(env_with_romfs((data / 'env.txt').read_text(encoding='utf-8'), target), encoding='utf-8', newline='\n')
+                text = (data / 'env.txt').read_text(encoding='utf-8')
+                if target: text = env_with_romfs(text, target)
+                if cloud: text = env_with_cloud(text, cloud)
+                env = Path(t) / 'env.txt'; env.write_text(text, encoding='utf-8', newline='\n')
                 adb.push_file(env, f'{files}/env.txt')
+            if cloud: say(f'cloud saves: {cloud}')
         elif was and romfs_at == APP:
             if sd_dir: PROG.set(step='removing the RomFS from the SD card'); adb.shell(f'rm -rf {shlex.quote(was)}', timeout=1200); say(f'the app reads its RomFS from its files folder again; {was} (the earlier --romfs-at sd copy) is removed')
             else: say(f'the app reads its RomFS from its files folder again; {was} is left as it is')

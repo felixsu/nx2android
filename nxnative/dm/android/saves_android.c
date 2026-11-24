@@ -11,6 +11,8 @@
 // current save is exported first (<stamp>-before-import), the folder is copied to <DM_SAVE>.import and swapped with the save in one step (renameat2 RENAME_EXCHANGE),
 // and the old tree is removed. saves/export.txt asks for an export at the next start (porter saves export); "quit" in it ends the app after it, without starting the
 // game. Each request's outcome is saves/result.txt (KEY=VALUE lines: request, the token the request carried; result, ok or error; name, backup or error)
+// A cloud download (cloud_android.c) is an import with request=cloud: the current save is exported as <stamp>-before-cloud instead (the newest SAVES_CLOUD_KEEP are
+// kept), and once the import is in, saves/cloud-pending.txt becomes the cloud sync base saves/cloud.txt and the downloaded folder goes
 #include "dm.h"
 #include "saves_android.h"
 #include <dirent.h>
@@ -147,19 +149,48 @@ int dm_saves_list(dm_save_entry *out, int max) {
     return n;
 }
 
-int dm_saves_request_import(const char *name) {
+const char *dm_saves_save_path(void) { return g_save; }
+const char *dm_saves_device_path(void) { return g_dev; }
+void dm_saves_remove(const char *name) {
+    if (!name[0] || strchr(name, '/') || name[0] == '.') return;
+    char p[700], pd[720]; snprintf(p, sizeof p, "%s/%s", g_dir, name); snprintf(pd, sizeof pd, "%s.device", p); rm_tree(p); rm_tree(pd);
+}
+int dm_saves_request_import(const char *name) { return dm_saves_request_import_as(name, "menu"); }
+int dm_saves_request_import_as(const char *name, const char *request) {
     char p[640], tmp[650]; snprintf(p, sizeof p, "%s/import.txt", g_dir); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] [saves] cannot write %s (errno %d)", tmp, errno); return -1; }
-    fprintf(f, "%s\nrequest=menu\n", name); fclose(f);
+    fprintf(f, "%s\nrequest=%s\n", name, request); fclose(f);
     if (rename(tmp, p)) { LOG("[RED] [saves] cannot write %s (errno %d)", p, errno); return -1; }
     LOG("[saves] %s will be imported at the next start", name); return 0;
 }
 
+static int by_name_desc(const void *a, const void *b) { return strcmp(*(char *const *)b, *(char *const *)a); }
+static void prune_cloud_backups(void) {   // the newest SAVES_CLOUD_KEEP <stamp>-before-cloud folders (their names sort by time); the user's own exports are not touched
+    DIR *d = opendir(g_dir); struct dirent *e; char *names[256]; int n = 0; if (!d) return;
+    while (n < 256 && (e = readdir(d))) { const char *m = strstr(e->d_name, "-before-cloud"); size_t L = strlen(e->d_name);
+        if (e->d_name[0] != '.' && m && !(L > 7 && !strcmp(e->d_name + L - 7, ".device")) && (names[n] = strdup(e->d_name))) n++; }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof *names, by_name_desc);
+    for (int i = 0; i < n; i++) { if (i >= SAVES_CLOUD_KEEP) { dm_saves_remove(names[i]); LOG("[saves] removed the old cloud backup %s (the newest %d are kept)", names[i], SAVES_CLOUD_KEEP); } free(names[i]); }
+}
+static void cloud_import_done(const char *name, int ok) {   // a cloud download's import (cloud_android.c): its folder goes, and on success it is the sync base
+    char p[640], q[640]; snprintf(p, sizeof p, "%s/cloud-pending.txt", g_dir); snprintf(q, sizeof q, "%s/cloud.txt", g_dir);
+    if (ok) { if (rename(p, q)) LOG("[RED] [saves] cannot make %s the cloud sync base (errno %d)", p, errno); dm_saves_remove(name); prune_cloud_backups(); }
+    else unlink(p);
+}
+static void import_apply_one(const char *name, const char *req);
 static void import_apply(const char *name, const char *req) {
+    int cloud = !strcmp(req, "cloud");
+    import_apply_one(name, req);
+    if (cloud) { char p[640], line[200]; int ok = 0; snprintf(p, sizeof p, "%s/result.txt", g_dir);   // result() wrote this request's outcome
+        FILE *f = fopen(p, "r"); while (f && fgets(line, sizeof line, f)) if (!strncmp(line, "result=ok", 9)) ok = 1; if (f) fclose(f);
+        cloud_import_done(name, ok); }
+}
+static void import_apply_one(const char *name, const char *req) {
     char src[700], srcd[720], err[600] = "", bk[96] = ""; snprintf(src, sizeof src, "%s/%s", g_dir, name); snprintf(srcd, sizeof srcd, "%s.device", src);
     if (!name[0] || strchr(name, '/') || name[0] == '.' || !is_dir(src)) { result(req, "result=error\nerror=no save folder %s in %s", name, g_dir); return; }
     if (!has_entries(src) && !is_dir(srcd)) { result(req, "result=error\nerror=%s is empty", name); return; }
-    int r = dm_saves_export("-before-import", bk, sizeof bk, err, sizeof err);   // the current save first, so an import can be taken back
+    int r = dm_saves_export(!strcmp(req, "cloud") ? "-before-cloud" : "-before-import", bk, sizeof bk, err, sizeof err);   // the current save first, so an import can be taken back
     if (r && r != -ENOENT) { result(req, "result=error\nerror=the current save could not be backed up first (%s): nothing was imported", err); return; }
     if (r) bk[0] = 0;
     const char *from[2] = {src, srcd}, *to[2] = {g_save, g_dev}; char tmp[2][640]; long files = 0; long long bytes = 0;
