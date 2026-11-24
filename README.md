@@ -84,7 +84,7 @@ The step-by-step guide is [packaging/INSTALL.md](packaging/INSTALL.md). You need
 
 ## Saves
 
-The game's pause menu (Game tab) has **Export save** and **Import save**: an export is a folder in `Android/data/<package>/files/saves/` on the device, the save's files as a console's save tools copy them, so a save from a console imports the same way. The app's **Saves** tab moves them between the device and the PC.
+The game's pause menu (Game tab) has **Export save** and **Saves & cloud** (import a save; with the game library, upload it to and download it from the library's cloud saves): an export is a folder in `Android/data/<package>/files/saves/` on the device, the save's files as a console's save tools copy them, so a save from a console imports the same way. The app's **Saves** tab moves them between the device and the PC.
 
 An import replaces the save the game has; the app exports that one first on the device (a folder ending `-before-import`). Uninstalling the app deletes its saves and its exports: copy them to the PC first.
 

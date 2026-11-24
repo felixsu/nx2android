@@ -12,3 +12,10 @@ int dm_saves_start(const char *files_root);
 int dm_saves_export(const char *suffix, char *name, int cap, char *err, int ecap);
 int dm_saves_list(dm_save_entry *out, int max);   // the save folders in saves/, newest first
 int dm_saves_request_import(const char *name);    // name is imported at the next start: 0, or -1 when the request cannot be written
+// the same with the request's token: "cloud" (cloud_android.c) backs up the current save as <stamp>-before-cloud (the newest SAVES_CLOUD_KEEP are kept),
+// makes saves/cloud-pending.txt the sync base (saves/cloud.txt) and removes the downloaded folder once it is in
+int dm_saves_request_import_as(const char *name, const char *request);
+#define SAVES_CLOUD_KEEP 5
+const char *dm_saves_save_path(void);     // $DM_SAVE
+const char *dm_saves_device_path(void);   // $DM_SAVE_device
+void dm_saves_remove(const char *name);   // saves/<name> and saves/<name>.device
