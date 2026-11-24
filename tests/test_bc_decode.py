@@ -29,15 +29,17 @@ class BCDecode(unittest.TestCase):
         adapter = csrc.between(source, 'static void bc_decode(', 'static pthread_mutex_t g_fmt_mu')
         wrapper = Path(cls.tmp.name) / 'adapter.c'
         wrapper.write_text('#include <stdint.h>\n#include <stdlib.h>\n#include "nvn_bc.h"\n'
-                           'typedef struct {unsigned dec, dbpp;} vkfmt_t;\n'
+                           'typedef struct {unsigned dec, dbpp, astc;} vkfmt_t;\n'
+                           'void bc1_to_astc(const uint8_t *src, size_t pitch, uint32_t bx, uint32_t by, uint32_t z, int rgb, uint8_t *dst);\n'
+                           'void rgba_to_astc(const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t z, uint8_t *dst);\n'
                            '#define die(...) abort()\n' + adapter +
                            '\nvoid legacy_decode(unsigned dec, unsigned pixel, const uint8_t *src, size_t pitch, '
                            'uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) {'
-                           'vkfmt_t f={dec,pixel};vk_bc_decode(&f,src,pitch,w,h,z,dst);}\n')
+                           'vkfmt_t f={dec,pixel,0};vk_bc_decode(&f,src,pitch,w,h,z,dst);}\n')
         subprocess.run(['cc', '-shared', '-fPIC', '-O2', '-fno-strict-aliasing',
                         *getattr(cls, 'compiler_flags', []), '-I', str(TEX), str(TEX / 'nvn_bc.c'), str(TEX / 'nvn_deswizzle.c'),
-                        str(TEX / '../nvn/nvn_tex.c'), str(ROOT / 'tests/bc_layout_fixture.c'), str(wrapper),
-                        '-o', str(lib)], check=True, capture_output=True)
+                        str(TEX / '../nvn/nvn_tex.c'), str(ROOT / 'tests/bc_layout_fixture.c'), str(ROOT / 'nxnative/dm/android/gfx_vk_astc.c'), str(wrapper),
+                        '-pthread', '-lm', '-o', str(lib)], check=True, capture_output=True)
         cls.lib = C.CDLL(str(lib))
         cls.decode = cls.lib.nvn_bc_decode
         cls.decode.argtypes = [C.c_int, C.c_uint, C.c_uint, C.c_uint, C.c_void_p,
